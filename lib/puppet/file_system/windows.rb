@@ -4,6 +4,8 @@ require 'puppet/util/windows'
 class Puppet::FileSystem::Windows < Puppet::FileSystem::Posix
   FULL_CONTROL = Puppet::Util::Windows::File::FILE_ALL_ACCESS
   FILE_READ = Puppet::Util::Windows::File::FILE_GENERIC_READ
+  FILE_WRITE = Puppet::Util::Windows::File::FILE_GENERIC_WRITE
+  FILE_READ_WRITE = (FILE_READ | FILE_WRITE)
 
   def open(path, mode, options, &block)
     # PUP-6959 mode is explicitly ignored until it can be implemented
@@ -117,6 +119,7 @@ class Puppet::FileSystem::Windows < Puppet::FileSystem::Posix
   end
 
   # https://docs.microsoft.com/en-us/windows/desktop/debug/system-error-codes--0-499-
+  FILE_NOT_FOUND = 2
   ACCESS_DENIED = 5
   SHARING_VIOLATION = 32
   LOCK_VIOLATION = 33
@@ -134,10 +137,30 @@ class Puppet::FileSystem::Windows < Puppet::FileSystem::Posix
              dacl
            when 0640, 0600
              secure_dacl(current_sid)
+           when 0660
+             dacl = secure_dacl(current_sid, FILE_READ_WRITE, FILE_READ_WRITE)
+             dacl
+           when 0664
+             dacl = secure_dacl(current_sid, FILE_READ_WRITE, FILE_READ_WRITE)
+             dacl.allow(Puppet::Util::Windows::SID::BuiltinUsers, FILE_READ)
+             dacl.allow(Puppet::Util::Windows::SID::Everyone, FILE_READ)
+             dacl
+           when 0666
+             dacl = secure_dacl(current_sid, FILE_READ_WRITE, FILE_READ_WRITE)
+             dacl.allow(Puppet::Util::Windows::SID::BuiltinUsers, FILE_READ_WRITE)
+             dacl.allow(Puppet::Util::Windows::SID::Everyone, FILE_READ_WRITE)
+             dacl
+           when 0444
+             dacl = secure_dacl(current_sid, FILE_READ, FILE_READ)
+             dacl.allow(Puppet::Util::Windows::SID::BuiltinUsers, FILE_READ)
+             dacl.allow(Puppet::Util::Windows::SID::Everyone, FILE_READ)
+             dacl
+           when 0440
+             secure_dacl(current_sid, FILE_READ, FILE_READ)
            when nil
              get_dacl_from_file(path) || secure_dacl(current_sid)
            else
-             raise ArgumentError, "Only modes 0644, 0640 and 0600 are allowed"
+             raise ArgumentError, "#{mode} is invalid: Only modes 0644, 0640, 0660, 0666, 0600 and 0440 are allowed"
            end
 
 
@@ -177,7 +200,7 @@ class Puppet::FileSystem::Windows < Puppet::FileSystem::Posix
     Puppet::Util::Windows::Security.set_security_descriptor(path, new_sd)
   end
 
-  def secure_dacl(current_sid)
+  def secure_dacl(current_sid, owner_permission = FULL_CONTROL, group_permission = FULL_CONTROL)
     dacl = Puppet::Util::Windows::AccessControlList.new
     [
      Puppet::Util::Windows::SID::LocalSystem,
@@ -185,6 +208,9 @@ class Puppet::FileSystem::Windows < Puppet::FileSystem::Posix
      current_sid
     ].uniq.map do |sid|
       dacl.allow(sid, FULL_CONTROL)
+      permission = owner_permission
+      permission = group_permission if Puppet::Util::Windows::SID::BuiltinAdministrators
+      dacl.allow(sid, permission)
     end
     dacl
   end
@@ -193,11 +219,7 @@ class Puppet::FileSystem::Windows < Puppet::FileSystem::Posix
     sd = Puppet::Util::Windows::Security.get_security_descriptor(Puppet::FileSystem.path_string(path))
     sd.dacl
   rescue Puppet::Util::Windows::Error => e
-    if e.code == 2 # ERROR_FILE_NOT_FOUND
-      nil
-    else
-      raise e
-    end
+    raise e unless e.code == FILE_NOT_FOUND
   end
 
   def raise_if_symlinks_unsupported
